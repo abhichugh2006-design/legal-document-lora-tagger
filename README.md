@@ -93,7 +93,23 @@ use it.
 `python -m app.cli sweep --full` trains each configuration from scratch and scores it on the same held-out
 test set ([outputs/sweep.md](outputs/sweep.md)):
 
-SWEEP_TABLE
+| Run | Trainable params | Saved weights | Test accuracy | Macro-F1 | Train time (M3) |
+|---|---|---|---|---|---|
+| LoRA r=1 on attn.c_attn | 44,544 | 0.18 MB | 99.1% | 0.992 | 44s |
+| LoRA r=4 on attn.c_attn | 155,136 | 0.62 MB | 94.4% | 0.942 | 46s |
+| LoRA r=8 on attn.c_attn (default) | 302,592 | 1.2 MB | 91.9% | 0.917 | 64s |
+| LoRA r=32 on attn.c_attn | 1,187,328 | 4.7 MB | 91.5% | 0.912 | 69s |
+| LoRA r=8 on attn.c_attn + attn.c_proj | 450,048 | 1.8 MB | 94.0% | 0.938 | 59s |
+| LoRA r=8 on attention + MLP (all 4 layers) | 1,187,328 | 4.7 MB | 96.2% | 0.961 | 72s |
+
+One seed per row on a 234-clause test set. The same r=8 setup scored 93.2% in the main run and 91.9%
+here (MPS training is not bit-for-bit deterministic), so treat gaps under about 2 points as noise.
+
+**What it shows.** A higher rank does *not* help: r=1, with 44k parameters (0.04% of GPT-2), did as well as
+or better than r=32. Telling apart ten clause types is a low-rank change, and extra capacity mostly fits the
+training templates. Spreading the same rank across more layers (attention + MLP) helped more than raising
+the rank on one layer. A full fine-tuning comparison (`--full`, all 124M weights) needs about 4 GB of free
+memory and is being added.
 
 ## Milestones
 
