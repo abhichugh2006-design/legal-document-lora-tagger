@@ -108,8 +108,7 @@ here (MPS training is not bit-for-bit deterministic), so treat gaps under about 
 **What it shows.** A higher rank does *not* help: r=1, with 44k parameters (0.04% of GPT-2), did as well as
 or better than r=32. Telling apart ten clause types is a low-rank change, and extra capacity mostly fits the
 training templates. Spreading the same rank across more layers (attention + MLP) helped more than raising
-the rank on one layer. A full fine-tuning comparison (`--full`, all 124M weights) needs about 4 GB of free
-memory and is being added.
+the rank on one layer. **Full fine-tuning did not fit.** `sweep --full` (all 124M weights trainable) ran out of GPU memory on this 8 GB M3 laptop: gradients plus AdamW state for every weight take several GB more than the model itself, while every LoRA run above trained in under 5 GB. On this hardware LoRA is the only way to fine-tune GPT-2, and its adapter is 100-2,800x smaller to store. On a machine with more memory, the same command adds the full fine-tuning row to `outputs/sweep.md`.
 
 ## Milestones
 

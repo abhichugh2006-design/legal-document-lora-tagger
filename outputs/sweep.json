@@ -1,0 +1,60 @@
+[
+  {
+    "run": "LoRA r=1 on attn.c_attn",
+    "trainable_params": 44544,
+    "accuracy": 0.9914529914529915,
+    "macro_f1": 0.9916630481980026,
+    "train_seconds": 44.3108668330824,
+    "saved_mb": 0.178176,
+    "gpu_memory_gb": 3.4885632
+  },
+  {
+    "run": "LoRA r=4 on attn.c_attn",
+    "trainable_params": 155136,
+    "accuracy": 0.9444444444444444,
+    "macro_f1": 0.942498190765668,
+    "train_seconds": 45.83258529100567,
+    "saved_mb": 0.620544,
+    "gpu_memory_gb": 3.496951808
+  },
+  {
+    "run": "LoRA r=8 on attn.c_attn",
+    "trainable_params": 302592,
+    "accuracy": 0.9188034188034188,
+    "macro_f1": 0.9168662232076865,
+    "train_seconds": 64.31030075007584,
+    "saved_mb": 1.210368,
+    "gpu_memory_gb": 4.562305024
+  },
+  {
+    "run": "LoRA r=32 on attn.c_attn",
+    "trainable_params": 1187328,
+    "accuracy": 0.9145299145299145,
+    "macro_f1": 0.9123809523809523,
+    "train_seconds": 69.30833575001452,
+    "saved_mb": 4.749312,
+    "gpu_memory_gb": 4.581179392
+  },
+  {
+    "run": "LoRA r=8 on attn.c_attn,attn.c_proj",
+    "trainable_params": 450048,
+    "accuracy": 0.9401709401709402,
+    "macro_f1": 0.9383188405797102,
+    "train_seconds": 59.35025666700676,
+    "saved_mb": 1.800192,
+    "gpu_memory_gb": 3.538894848
+  },
+  {
+    "run": "LoRA r=8 on attn.c_attn,attn.c_proj,mlp.c_fc,mlp.c_proj",
+    "trainable_params": 1187328,
+    "accuracy": 0.9615384615384616,
+    "macro_f1": 0.9611336032388664,
+    "train_seconds": 71.84614237491041,
+    "saved_mb": 4.749312,
+    "gpu_memory_gb": 4.797186048
+  },
+  {
+    "run": "Full fine-tuning (all weights)",
+    "error": "MPS out of memory on 8 GB Apple M3"
+  }
+]
