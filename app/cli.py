@@ -120,6 +120,63 @@ def cmd_evaluate(args) -> None:
     print(f"Wrote {out} and {out.with_suffix('.json')}")
 
 
+def cmd_sweep(args) -> None:
+    """Stretch: compare LoRA ranks, target layers, and (optionally) full fine-tuning on the test set."""
+    import gc
+    import json
+    from pathlib import Path
+
+    from app import core
+
+    splits = core.prepare_dataset(args.source, seed=args.seed)
+    tags = sorted({r["tag"] for r in splits["train"]}) if args.source else core.TAGS
+    runs = [(f"LoRA r={r} on attn.c_attn", r, ("attn.c_attn",)) for r in args.ranks]
+    runs += [(f"LoRA r=8 on {t}", 8, tuple(t.split(","))) for t in args.target_sets]
+    if args.full:
+        runs.append(("Full fine-tuning (all weights)", None, None))
+    rows = []
+    for name, rank, targets in runs:
+        print(f"\n=== {name}")
+        model, tokenizer = core.load_base(core.BASE_MODEL)
+        tag_ids = core.extend_tokenizer_and_model(model, tokenizer, tags)
+        if rank is None:
+            for p in model.parameters():
+                p.requires_grad = True
+            trainable = sum(p.numel() for p in model.parameters())
+            lr = 5e-5
+        else:
+            core.add_lora_adapter(model, tag_ids, r=rank, alpha=2 * rank, targets=targets)
+            trainable = core.parameter_report(model)["trainable_params"]
+            lr = args.lr
+        history = core.train_tagger(model, tokenizer, tag_ids, splits, epochs=args.epochs, lr=lr, seed=args.seed,
+                                    device=args.device, log=lambda *_: None)
+        metrics = core.evaluate_tagger(model, tokenizer, tag_ids, splits["test"], tags)
+        mem = core.torch.mps.driver_allocated_memory() / 1e9 if history["device"] == "mps" else None
+        rows.append({"run": name, "trainable_params": trainable, "accuracy": metrics["accuracy"],
+                     "macro_f1": metrics["macro_f1"], "train_seconds": history["train_seconds"],
+                     "saved_mb": trainable * 4 / 1e6, "gpu_memory_gb": mem})
+        print({k: v for k, v in rows[-1].items() if k != "run"})
+        del model
+        gc.collect()
+        if history["device"] == "mps":
+            core.torch.mps.empty_cache()
+
+    lines = ["# Experiments: LoRA rank, target layers, full fine-tuning", "",
+             f"Built-in corpus, held-out test templates ({len(splits['test'])} clauses), {args.epochs} epochs, "
+             f"seed {args.seed}, alpha = 2r. One seed per row, so differences of a point or two are noise.", "",
+             "| Run | Trainable params | Saved weights | Test accuracy | Macro-F1 | Train time | GPU memory |",
+             "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        mem = f"{r['gpu_memory_gb']:.1f} GB" if r["gpu_memory_gb"] is not None else "n/a"
+        lines.append(f"| {r['run']} | {r['trainable_params']:,} | {r['saved_mb']:.1f} MB | {r['accuracy']:.1%} | "
+                     f"{r['macro_f1']:.3f} | {r['train_seconds']:.0f}s | {mem} |")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n")
+    out.with_suffix(".json").write_text(json.dumps(rows, indent=2))
+    print("\n" + "\n".join(lines) + f"\n\nWrote {out}")
+
+
 def add_lora_args(p) -> None:
     p.add_argument("--rank", type=int, default=8)
     p.add_argument("--alpha", type=float, default=16.0)
@@ -166,6 +223,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", default="outputs/evaluation.md")
     p.add_argument("--device")
     p.set_defaults(func=cmd_evaluate)
+
+    p = sub.add_parser("sweep", help="stretch: compare LoRA ranks / target layers / full fine-tuning")
+    p.add_argument("--ranks", type=int, nargs="+", default=[1, 4, 8, 32])
+    p.add_argument("--target-sets", nargs="*", default=["attn.c_attn,attn.c_proj",
+                                                         "attn.c_attn,attn.c_proj,mlp.c_fc,mlp.c_proj"])
+    p.add_argument("--full", action="store_true", help="also run full fine-tuning (needs ~4 GB free memory)")
+    p.add_argument("--source")
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device")
+    p.add_argument("--out", default="outputs/sweep.md")
+    p.set_defaults(func=cmd_sweep)
 
     args = parser.parse_args(argv)
     if args.command == "hello":

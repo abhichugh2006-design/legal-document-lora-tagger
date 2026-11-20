@@ -8,5 +8,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+      # CPU-only torch: the tests use a tiny GPT-2, so the multi-GB CUDA build is not needed.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r requirements.txt
       - run: pytest -q

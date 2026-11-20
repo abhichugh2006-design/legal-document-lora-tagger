@@ -26,3 +26,12 @@ def test_the_command_line_runs(capsys):
     main(["hello"])
     assert "is ready" in capsys.readouterr().out
 
+
+
+def test_the_prepare_command_writes_jsonl(tmp_path, capsys):
+    from app.cli import main
+    from app.data import load_jsonl
+    main(["prepare", "--per-template", "2", "--out", str(tmp_path)])
+    rows = load_jsonl(tmp_path / "test.jsonl")
+    assert rows and {"text", "tag", "prompt", "target"} <= set(rows[0])
+    assert "Tag:<|tag:" in capsys.readouterr().out
