@@ -90,3 +90,40 @@ def tag_counts(rows: list[dict]) -> dict[str, int]:
     for row in rows:
         counts[row["tag"]] = counts.get(row["tag"], 0) + 1
     return counts
+
+
+# =====================================================================================================
+# Milestone 2: Extend GPT-2 tokenizer and model for custom tags
+# =====================================================================================================
+# Each tag becomes one new special token, so predicting a tag is a single next-token choice. After
+# adding tokens, the embedding matrix is resized. GPT-2 ties its output head to the input embeddings,
+# so each new row is both how the model reads the tag and the vector it scores against when it predicts
+# one. The new rows start as the mean embedding of the tag's name (" force majeure", ...), which gives
+# every tag a distinct, meaningful starting point instead of identical copies.
+
+BASE_MODEL = "gpt2"
+
+
+def load_base(model_name: str = BASE_MODEL):
+    from transformers import AutoTokenizer, GPT2LMHeadModel
+
+    return GPT2LMHeadModel.from_pretrained(model_name), AutoTokenizer.from_pretrained(model_name)
+
+
+def extend_tokenizer_and_model(model, tokenizer, tags: list[str] = TAGS) -> list[int]:
+    """Milestone 2. Add one special token per tag, resize embeddings, initialise the new rows.
+
+    Returns the token ids of the tags, in the same order as `tags`. Works in place.
+    """
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad token; masked out anyway
+    name_ids = [tokenizer.encode(" " + tag.replace("_", " ")) for tag in tags]  # before adding tokens
+    tokenizer.add_special_tokens({"additional_special_tokens": [tag_token(t) for t in tags]})
+    model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    tag_ids = tokenizer.convert_tokens_to_ids([tag_token(t) for t in tags])
+    wte = model.get_input_embeddings().weight
+    with torch.no_grad():
+        for tag_id, ids in zip(tag_ids, name_ids):
+            wte[tag_id] = wte[ids].mean(dim=0)
+    model.config.pad_token_id = tokenizer.pad_token_id
+    return tag_ids

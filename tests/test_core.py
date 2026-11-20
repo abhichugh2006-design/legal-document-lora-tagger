@@ -32,9 +32,26 @@ def test_milestone_1_long_clauses_keep_the_tag_slot(gpt2_tokenizer):
 
 
 # Milestone 2: Extend GPT-2 tokenizer and model for custom tags
-@pytest.mark.skip(reason="remove this line when you start milestone 2")
-def test_milestone_2():
-    raise NotImplementedError("write the test for milestone 2")
+def test_milestone_2_tags_are_single_tokens_with_distinct_embeddings(tiny_gpt2, gpt2_tokenizer):
+    import copy
+
+    tok = copy.deepcopy(gpt2_tokenizer)
+    old_vocab = len(tok)
+    tag_ids = core.extend_tokenizer_and_model(tiny_gpt2, tok)
+
+    assert len(tok) == old_vocab + len(TAGS)
+    assert tiny_gpt2.get_input_embeddings().weight.shape[0] == len(tok)
+    assert tiny_gpt2.get_output_embeddings().weight.shape[0] == len(tok)  # tied head resized too
+    assert tag_ids == list(range(old_vocab, old_vocab + len(TAGS)))
+    for tag, tag_id in zip(TAGS, tag_ids):
+        assert tok.encode(core.format_example("x", tag))[-1] == tag_id  # tag is one token
+    rows = tiny_gpt2.get_input_embeddings().weight[tag_ids]
+    assert len({tuple(r.tolist()) for r in rows}) == len(TAGS)  # all different starting points
+    assert tok.pad_token is not None
+
+    encoded = core.encode_example(tok, "The City shall pay.", "payment")
+    assert encoded["labels"][-1] == tag_ids[TAGS.index("payment")]
+    assert all(label == core.IGNORE for label in encoded["labels"][:-1])
 
 
 # Milestone 3: Implement LoRA adapter and inject into GPT-2
