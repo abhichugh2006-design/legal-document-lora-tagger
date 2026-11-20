@@ -55,9 +55,57 @@ def test_milestone_2_tags_are_single_tokens_with_distinct_embeddings(tiny_gpt2, 
 
 
 # Milestone 3: Implement LoRA adapter and inject into GPT-2
-@pytest.mark.skip(reason="remove this line when you start milestone 3")
-def test_milestone_3():
-    raise NotImplementedError("write the test for milestone 3")
+def _tagger(model, tokenizer, **lora_kwargs):
+    import copy
+
+    tok = copy.deepcopy(tokenizer)
+    tag_ids = core.extend_tokenizer_and_model(model, tok)
+    core.add_lora_adapter(model, tag_ids, **lora_kwargs)
+    return model, tok, tag_ids
+
+
+def test_milestone_3_lora_layer_starts_as_identity_and_trains_low_rank():
+    import torch
+    from transformers.pytorch_utils import Conv1D
+
+    from app.lora import LoRALayer
+
+    torch.manual_seed(0)
+    base = Conv1D(nf=24, nx=16)  # GPT-2 layout: weight is (in=16, out=24)
+    layer = LoRALayer(base, r=4, alpha=8)
+    x = torch.randn(3, 16)
+    assert torch.allclose(layer(x), base(x))  # B = 0 at start
+    assert layer.lora_A.numel() + layer.lora_B.numel() == 4 * (16 + 24)
+    assert not base.weight.requires_grad
+
+    with torch.no_grad():
+        layer.lora_B.normal_()
+    expected = base(x) + x @ layer.delta_weight()
+    assert torch.allclose(layer(x), expected, atol=1e-5)
+    assert torch.linalg.matrix_rank(layer.delta_weight()) <= 4
+
+
+def test_milestone_3_injection_freezes_gpt2_except_adapter(tiny_gpt2, gpt2_tokenizer):
+    import torch
+
+    from app.lora import LoRALayer
+
+    ids = torch.tensor([[464, 2254, 2236, 1414]])
+    before = tiny_gpt2(ids).logits
+    model, tok, tag_ids = _tagger(tiny_gpt2, gpt2_tokenizer, r=4, alpha=8, dropout=0.0)
+
+    wrapped = [m for m in model.modules() if isinstance(m, LoRALayer)]
+    assert len(wrapped) == model.config.n_layer  # one c_attn per block
+    assert torch.allclose(model(ids).logits[..., : before.shape[-1]], before, atol=1e-5)
+
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert all("lora_" in n or n == "transformer.wte.weight" for n in trainable)
+
+    report = core.parameter_report(model)
+    d = model.config.n_embd
+    assert report["lora_params"] == model.config.n_layer * 4 * (d + 3 * d)
+    assert report["tag_embedding_params"] == len(TAGS) * d
+    assert report["trainable_percent"] < 5
 
 
 # Milestone 4: Fine-tune GPT-2 with LoRA on the clause dataset

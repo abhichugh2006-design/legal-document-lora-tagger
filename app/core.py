@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from app import lora
 from app.data import TAGS, generate_clauses, load_jsonl
 
 # =====================================================================================================
@@ -127,3 +128,40 @@ def extend_tokenizer_and_model(model, tokenizer, tags: list[str] = TAGS) -> list
             wte[tag_id] = wte[ids].mean(dim=0)
     model.config.pad_token_id = tokenizer.pad_token_id
     return tag_ids
+
+
+# =====================================================================================================
+# Milestone 3: Implement LoRA adapter and inject into GPT-2
+# =====================================================================================================
+# The LoRA layer itself is in app/lora.py. Here it is injected into GPT-2's attention blocks, and every
+# pretrained weight is frozen. One more piece must learn: the new tag-token rows from milestone 2, or the
+# model has no trained vector to score each tag against. A gradient mask lets only those few rows of
+# the embedding matrix change; the original 50,257 rows stay frozen.
+
+DEFAULT_TARGETS = ("attn.c_attn",)
+
+
+def add_lora_adapter(model, tag_ids: list[int], r: int = 8, alpha: float = 16.0, dropout: float = 0.05,
+                     targets=DEFAULT_TARGETS) -> list[str]:
+    """Milestone 3. Freeze GPT-2, inject LoRA into `targets`, and unfreeze only the tag embedding rows."""
+    names = lora.inject_lora(model, targets=targets, r=r, alpha=alpha, dropout=dropout)
+    wte = model.get_input_embeddings().weight
+    wte.requires_grad = True
+    mask = torch.zeros(wte.shape[0], 1)
+    mask[tag_ids] = 1.0
+    wte.register_hook(lambda grad: grad * mask.to(grad.device, grad.dtype))
+    model._tag_ids = list(tag_ids)
+    return names
+
+
+def parameter_report(model, tag_ids: list[int] | None = None) -> dict[str, float]:
+    """Count what LoRA trains versus what full fine-tuning would train."""
+    tag_ids = tag_ids if tag_ids is not None else getattr(model, "_tag_ids", [])
+    n_lora = lora.count_lora_params(model)
+    n_tag_rows = len(tag_ids) * model.get_input_embeddings().weight.shape[1]
+    total = sum(p.numel() for p in model.parameters())
+    base = total - n_lora
+    trainable = n_lora + n_tag_rows
+    return {"base_params": base, "lora_params": n_lora, "tag_embedding_params": n_tag_rows,
+            "trainable_params": trainable, "trainable_percent": 100.0 * trainable / base,
+            "reduction_factor": base / trainable if trainable else float("inf")}
