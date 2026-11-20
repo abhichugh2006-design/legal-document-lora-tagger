@@ -165,3 +165,142 @@ def parameter_report(model, tag_ids: list[int] | None = None) -> dict[str, float
     return {"base_params": base, "lora_params": n_lora, "tag_embedding_params": n_tag_rows,
             "trainable_params": trainable, "trainable_percent": 100.0 * trainable / base,
             "reduction_factor": base / trainable if trainable else float("inf")}
+
+
+# =====================================================================================================
+# Milestone 4: Fine-tune GPT-2 with LoRA on the clause dataset
+# =====================================================================================================
+# A plain PyTorch loop: AdamW over only the trainable tensors, linear warmup/decay, loss only on the tag
+# token (milestone 1 labels). Validation accuracy is checked after each epoch. The saved adapter holds
+# only the LoRA matrices and the tag rows: a few MB instead of a 500 MB GPT-2 checkpoint.
+
+
+def pick_device(prefer: str | None = None) -> torch.device:
+    if prefer:
+        return torch.device(prefer)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def next_token_logits(model, input_ids, attention_mask, positions) -> torch.Tensor:
+    """Full-vocabulary logits at one position per sequence, shape (batch, vocab).
+
+    Same numbers as model(...).logits[range(batch), positions], but it skips projecting every position
+    onto the 50k-token vocabulary, the largest tensor in a GPT-2 forward pass. The cross-entropy over
+    these logits equals the usual shifted LM loss when only the tag token is labelled."""
+    hidden = model.transformer(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    return model.lm_head(hidden[torch.arange(hidden.shape[0], device=hidden.device), positions])
+
+
+@torch.no_grad()
+def tag_probabilities(model, tokenizer, tag_ids: list[int], texts: list[str], batch_size: int = 32,
+                      max_len: int = MAX_LEN) -> torch.Tensor:
+    """For each clause, a probability for every tag (the next-token distribution after "Tag:",
+    restricted to the tag tokens). Shape (len(texts), len(tag_ids))."""
+    model.eval()
+    device = next(model.parameters()).device
+    out = []
+    for start in range(0, len(texts), batch_size):
+        batch = [{"input_ids": encode_prompt(tokenizer, t, max_len)} for t in texts[start:start + batch_size]]
+        enc = collate(batch, tokenizer.pad_token_id)
+        last = enc["attention_mask"].sum(dim=1) - 1  # last real token, i.e. ":" in "Tag:"
+        rows = next_token_logits(model, enc["input_ids"].to(device), enc["attention_mask"].to(device), last.to(device))
+        out.append(rows[:, tag_ids].float().softmax(dim=-1).cpu())
+    return torch.cat(out) if out else torch.empty(0, len(tag_ids))
+
+
+def accuracy_on(model, tokenizer, tag_ids, rows: list[dict], tags: list[str] = TAGS) -> float:
+    if not rows:
+        return float("nan")
+    probs = tag_probabilities(model, tokenizer, tag_ids, [r["text"] for r in rows])
+    preds = [tags[i] for i in probs.argmax(dim=-1).tolist()]
+    return sum(p == r["tag"] for p, r in zip(preds, rows)) / len(rows)
+
+
+def train_tagger(model, tokenizer, tag_ids: list[int], splits: dict[str, list[dict]], epochs: int = 3,
+                 batch_size: int = 16, lr: float = 3e-4, tag_lr: float = 2e-3, weight_decay: float = 0.01,
+                 seed: int = 0, device: torch.device | str | None = None, max_steps: int | None = None,
+                 log=print) -> dict:
+    """Milestone 4. Train whatever is trainable in `model` (LoRA + tag rows, or everything for a full
+    fine-tune) on splits['train']. Returns a history dict with losses, val accuracy and timing."""
+    import random
+    import time
+
+    from transformers import get_linear_schedule_with_warmup
+
+    device = pick_device(device) if not isinstance(device, torch.device) else device
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    model.to(device)
+    wte = model.get_input_embeddings().weight
+    others = [p for p in model.parameters() if p.requires_grad and p is not wte]
+    groups = [{"params": others, "lr": lr, "weight_decay": weight_decay}]
+    if wte.requires_grad:  # tag rows: no weight decay, or the frozen rows would shrink too
+        groups.append({"params": [wte], "lr": tag_lr if hasattr(model, "_tag_ids") else lr, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(groups)
+
+    encoded = [encode_example(tokenizer, r["text"], r["tag"]) for r in splits["train"]]
+    steps_per_epoch = (len(encoded) + batch_size - 1) // batch_size
+    total_steps = min(max_steps or 10**9, steps_per_epoch * epochs)
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * total_steps), total_steps)
+
+    history = {"loss": [], "val_accuracy": [], "device": str(device), "steps": 0}
+    start = time.perf_counter()
+    step = 0
+    for epoch in range(epochs):
+        model.train()
+        rng.shuffle(encoded)
+        for i in range(0, len(encoded), batch_size):
+            batch = {k: v.to(device) for k, v in collate(encoded[i:i + batch_size], tokenizer.pad_token_id).items()}
+            target_pos = (batch["labels"] != IGNORE).int().argmax(dim=1)  # where the tag token sits
+            logits = next_token_logits(model, batch["input_ids"], batch["attention_mask"], target_pos - 1)
+            loss = torch.nn.functional.cross_entropy(logits.float(), batch["labels"][torch.arange(len(target_pos)), target_pos])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            history["loss"].append(loss.item())
+            step += 1
+            if step % 10 == 0:
+                log(f"epoch {epoch + 1} step {step}/{total_steps} loss {loss.item():.4f}")
+            if step >= total_steps:
+                break
+        val_acc = accuracy_on(model, tokenizer, tag_ids, splits.get("val", []))
+        history["val_accuracy"].append(val_acc)
+        log(f"epoch {epoch + 1} done: val accuracy {val_acc:.3f}")
+        if step >= total_steps:
+            break
+    history["steps"] = step
+    history["train_seconds"] = time.perf_counter() - start
+    model.eval()
+    return history
+
+
+def save_adapter(model, path: str | Path, config: dict) -> int:
+    """Save only what LoRA trained. Returns the file size in bytes."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tag_ids = model._tag_ids
+    torch.save({"config": config, "lora": lora.lora_state_dict(model),
+                "tag_rows": model.get_input_embeddings().weight[tag_ids].detach().cpu()}, path)
+    return path.stat().st_size
+
+
+def load_tagger(adapter_path: str | Path, device: str | None = None):
+    """Rebuild GPT-2 + tag tokens + LoRA from a saved adapter. Returns (model, tokenizer, tag_ids, config)."""
+    saved = torch.load(adapter_path, map_location="cpu", weights_only=True)
+    config = saved["config"]
+    model, tokenizer = load_base(config.get("base_model", BASE_MODEL))
+    tag_ids = extend_tokenizer_and_model(model, tokenizer, config["tags"])
+    add_lora_adapter(model, tag_ids, r=config["r"], alpha=config["alpha"], dropout=0.0,
+                     targets=tuple(config["targets"]))
+    missing = model.load_state_dict(saved["lora"], strict=False)
+    if missing.unexpected_keys:
+        raise ValueError(f"adapter does not match the model: {missing.unexpected_keys[:3]}")
+    with torch.no_grad():
+        model.get_input_embeddings().weight[tag_ids] = saved["tag_rows"]
+    return model.to(pick_device(device)).eval(), tokenizer, tag_ids, config

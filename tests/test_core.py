@@ -109,9 +109,34 @@ def test_milestone_3_injection_freezes_gpt2_except_adapter(tiny_gpt2, gpt2_token
 
 
 # Milestone 4: Fine-tune GPT-2 with LoRA on the clause dataset
-@pytest.mark.skip(reason="remove this line when you start milestone 4")
-def test_milestone_4():
-    raise NotImplementedError("write the test for milestone 4")
+def test_milestone_4_training_lowers_loss_and_only_touches_the_adapter(tiny_gpt2, gpt2_tokenizer, tmp_path):
+    import torch
+
+    model, tok, tag_ids = _tagger(tiny_gpt2, gpt2_tokenizer, r=4, alpha=8, dropout=0.0)
+    frozen = {n: p.detach().clone() for n, p in model.named_parameters() if "lora_" not in n}
+    splits = core.prepare_dataset(per_template=2, seed=0)
+    splits["train"] = splits["train"][:48]
+    splits["val"] = splits["val"][:16]
+
+    history = core.train_tagger(model, tok, tag_ids, splits, epochs=4, batch_size=8, lr=5e-3, tag_lr=5e-2,
+                                device="cpu", log=lambda *_: None)
+    losses = history["loss"]
+    assert sum(losses[-4:]) / 4 < sum(losses[:4]) / 4
+    assert len(history["val_accuracy"]) == 4 and history["steps"] == 24
+
+    after = dict(model.named_parameters())
+    for name, before in frozen.items():
+        if name == "transformer.wte.weight":
+            changed = (after[name] != before).any(dim=1).nonzero().flatten().tolist()
+            assert set(changed) <= set(tag_ids) and changed  # only tag rows moved
+        else:
+            assert torch.equal(after[name], before), f"{name} should be frozen"
+
+    size = core.save_adapter(model, tmp_path / "adapter.pt", {"r": 4})
+    assert 0 < size < 1_000_000
+    saved = torch.load(tmp_path / "adapter.pt", weights_only=True)
+    assert set(saved["lora"]) == {n for n in after if "lora_" in n}
+    assert torch.equal(saved["tag_rows"], after["transformer.wte.weight"][tag_ids].detach())
 
 
 # Milestone 5: Merge LoRA adapter and perform inference on new clauses
