@@ -67,6 +67,59 @@ def cmd_tag(args) -> None:
         print(f"Saved merged GPT-2 to {args.save_merged}")
 
 
+def cmd_evaluate(args) -> None:
+    import gc
+    import json
+    from pathlib import Path
+
+    from app import core
+    from app.storage import Store
+
+    splits = core.prepare_dataset(args.source)
+    test = splits["test"]
+    texts = [r["text"] for r in test]
+
+    # Baseline: GPT-2 with the tag tokens added (name-initialised) but no fine-tuning at all.
+    base, tokenizer = core.load_base(core.BASE_MODEL)
+    saved_tags = core.torch.load(args.adapter, map_location="cpu", weights_only=True)["config"]["tags"]
+    base_ids = core.extend_tokenizer_and_model(base, tokenizer, saved_tags)
+    base.to(core.pick_device(args.device))
+    baseline = core.evaluate_tagger(base, tokenizer, base_ids, test, saved_tags)
+    del base
+    gc.collect()
+
+    model, tokenizer, tag_ids, config = core.load_tagger(args.adapter, args.device)
+    tags = config["tags"]
+    efficiency = core.parameter_report(model, tag_ids)
+    efficiency["adapter_mb"] = Path(args.adapter).stat().st_size / 1e6
+    efficiency["full_checkpoint_mb"] = efficiency["base_params"] * 4 / 1e6  # float32
+    unmerged = core.evaluate_tagger(model, tokenizer, tag_ids, test, tags)
+    efficiency["latency_unmerged_ms"] = core.measure_latency(model, tokenizer, tag_ids, texts)
+    core.merge_adapter(model)
+    merged = core.evaluate_tagger(model, tokenizer, tag_ids, test, tags)
+    efficiency["latency_merged_ms"] = core.measure_latency(model, tokenizer, tag_ids, texts)
+    agreement = sum(a == b for a, b in zip(unmerged["predictions"], merged["predictions"])) / len(test)
+
+    result = {"config": config, "device": str(next(model.parameters()).device), "baseline": baseline,
+              "lora": unmerged, "merged": merged, "merge_agreement": agreement, "efficiency": efficiency}
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(core.render_evaluation(result))
+    out.with_suffix(".json").write_text(json.dumps(result, indent=2))
+    Store().put("last_eval", {"accuracy": merged["accuracy"], "macro_f1": merged["macro_f1"],
+                              "baseline_accuracy": baseline["accuracy"], **efficiency})
+    print(f"Baseline (no fine-tuning): accuracy {baseline['accuracy']:.1%}, macro-F1 {baseline['macro_f1']:.3f}")
+    print(f"LoRA:                      accuracy {unmerged['accuracy']:.1%}, macro-F1 {unmerged['macro_f1']:.3f}")
+    print(f"LoRA merged:               accuracy {merged['accuracy']:.1%}, macro-F1 {merged['macro_f1']:.3f}  "
+          f"(agreement with unmerged {agreement:.1%})")
+    print(f"Trainable params {efficiency['trainable_params']:,} = {efficiency['trainable_percent']:.3f}% "
+          f"({efficiency['reduction_factor']:.0f}x fewer); adapter {efficiency['adapter_mb']:.2f} MB vs "
+          f"{efficiency['full_checkpoint_mb']:.0f} MB")
+    print(f"Latency per clause: {efficiency['latency_unmerged_ms']:.2f} ms unmerged, "
+          f"{efficiency['latency_merged_ms']:.2f} ms merged")
+    print(f"Wrote {out} and {out.with_suffix('.json')}")
+
+
 def add_lora_args(p) -> None:
     p.add_argument("--rank", type=int, default=8)
     p.add_argument("--alpha", type=float, default=16.0)
@@ -106,6 +159,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--save-merged", help="also save the merged model to this folder")
     p.add_argument("--device")
     p.set_defaults(func=cmd_tag)
+
+    p = sub.add_parser("evaluate", help="milestone 6: accuracy, F1 and efficiency on the held-out test set")
+    p.add_argument("--adapter", default="artifacts/adapter.pt")
+    p.add_argument("--source", help="folder with your own train/val/test.jsonl (default: built-in corpus)")
+    p.add_argument("--out", default="outputs/evaluation.md")
+    p.add_argument("--device")
+    p.set_defaults(func=cmd_evaluate)
 
     args = parser.parse_args(argv)
     if args.command == "hello":

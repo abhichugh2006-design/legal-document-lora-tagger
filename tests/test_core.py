@@ -182,6 +182,28 @@ def test_milestone_5_documents_split_into_clauses_and_render(tiny_gpt2, gpt2_tok
 
 
 # Milestone 6: Evaluate tagging accuracy and model efficiency
-@pytest.mark.skip(reason="remove this line when you start milestone 6")
-def test_milestone_6():
-    raise NotImplementedError("write the test for milestone 6")
+def test_milestone_6_metrics_match_a_hand_worked_example():
+    labels = ["a", "b", "c"]
+    m = core.classification_metrics(["a", "a", "b", "c"], ["a", "b", "b", "a"], labels)
+    assert m["accuracy"] == 0.5
+    assert m["confusion"] == [[1, 1, 0], [0, 1, 0], [1, 0, 0]]
+    assert m["per_class"]["a"] == {"precision": 0.5, "recall": 0.5, "f1": 0.5, "support": 2}
+    assert m["per_class"]["b"]["precision"] == 0.5 and m["per_class"]["b"]["recall"] == 1.0
+    assert m["per_class"]["c"]["f1"] == 0.0
+    assert m["macro_f1"] == pytest.approx((0.5 + 2 / 3 + 0.0) / 3)
+
+
+def test_milestone_6_evaluation_report(tiny_gpt2, gpt2_tokenizer):
+    model, tok, tag_ids = _tagger(tiny_gpt2, gpt2_tokenizer, r=4, alpha=8)
+    rows = core.prepare_dataset(per_template=1, seed=0)["test"]
+    efficiency = core.parameter_report(model)
+    metrics = core.evaluate_tagger(model, tok, tag_ids, rows)
+    assert metrics["n"] == len(rows) and 0 <= metrics["accuracy"] <= 1
+    assert len(metrics["mistakes"]) == round(len(rows) * (1 - metrics["accuracy"]))
+    assert core.measure_latency(model, tok, tag_ids, [r["text"] for r in rows[:4]], repeats=1) > 0
+
+    efficiency.update(adapter_mb=1.0, full_checkpoint_mb=500.0, latency_unmerged_ms=2.0, latency_merged_ms=1.5)
+    report = core.render_evaluation({"lora": metrics, "merged": metrics, "baseline": metrics, "merge_agreement": 1.0,
+                                     "efficiency": efficiency, "device": "cpu",
+                                     "config": {"r": 4, "targets": ["attn.c_attn"]}})
+    assert "Macro-F1" in report and "fewer parameters" in report and "Confusion matrix" in report

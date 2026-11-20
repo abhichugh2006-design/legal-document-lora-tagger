@@ -392,3 +392,115 @@ def render_tagged_document(blocks: list[dict], title: str = "Tagged document") -
         lines += [f"**[{n}] `{b['tag']}`** {b['confidence']:.0%}{flag} <sub>next: {alts}</sub>", "",
                   f"> {b['text']}", ""]
     return "\n".join(lines)
+
+
+# =====================================================================================================
+# Milestone 6: Evaluate tagging accuracy and model efficiency
+# =====================================================================================================
+# Accuracy and macro-F1 on the held-out test templates, per-tag precision/recall/F1, and a confusion
+# matrix to show which clause types get mixed up. Efficiency: trainable parameters vs. full fine-tuning,
+# adapter size on disk vs. a full checkpoint, and latency before and after merging.
+
+
+def classification_metrics(y_true: list[str], y_pred: list[str], labels: list[str]) -> dict:
+    index = {label: i for i, label in enumerate(labels)}
+    confusion = [[0] * len(labels) for _ in labels]
+    for t, p in zip(y_true, y_pred):
+        confusion[index[t]][index[p]] += 1
+    per_class = {}
+    for i, label in enumerate(labels):
+        tp = confusion[i][i]
+        fp = sum(confusion[r][i] for r in range(len(labels))) - tp
+        fn = sum(confusion[i]) - tp
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        per_class[label] = {"precision": precision, "recall": recall, "f1": f1, "support": tp + fn}
+    present = [label for label in labels if per_class[label]["support"]]
+    n = len(y_true)
+    return {"n": n, "accuracy": sum(t == p for t, p in zip(y_true, y_pred)) / n if n else 0.0,
+            "macro_f1": sum(per_class[label]["f1"] for label in present) / len(present) if present else 0.0,
+            "per_class": per_class, "confusion": confusion, "labels": labels}
+
+
+def measure_latency(model, tokenizer, tag_ids, texts: list[str], repeats: int = 3) -> float:
+    """Milliseconds per clause (best of `repeats`, batch of 32), after one warm-up pass."""
+    import time
+
+    tag_probabilities(model, tokenizer, tag_ids, texts[:8])
+    best = float("inf")
+    for _ in range(repeats):
+        device = next(model.parameters()).device
+        start = time.perf_counter()
+        tag_probabilities(model, tokenizer, tag_ids, texts)
+        if device.type == "mps":
+            torch.mps.synchronize()
+        elif device.type == "cuda":
+            torch.cuda.synchronize()
+        best = min(best, time.perf_counter() - start)
+    return 1000 * best / len(texts)
+
+
+def evaluate_tagger(model, tokenizer, tag_ids, rows: list[dict], tags: list[str] = TAGS) -> dict:
+    """Milestone 6. Metrics on `rows`, plus the misclassified clauses for error analysis."""
+    preds = predict(model, tokenizer, tag_ids, [r["text"] for r in rows], tags)
+    metrics = classification_metrics([r["tag"] for r in rows], [p["tag"] for p in preds], tags)
+    metrics["predictions"] = [p["tag"] for p in preds]
+    metrics["mistakes"] = [{"text": r["text"], "true": r["tag"], "predicted": p["tag"], "confidence": p["confidence"],
+                            "template": r.get("template")} for r, p in zip(rows, preds) if p["tag"] != r["tag"]]
+    metrics["mean_confidence"] = sum(p["confidence"] for p in preds) / len(preds) if preds else 0.0
+    return metrics
+
+
+def render_evaluation(result: dict) -> str:
+    """A Markdown evaluation report from the dict built by `python -m app.cli evaluate`."""
+    m, eff = result["lora"], result["efficiency"]
+    tags = m["labels"]
+    lines = [
+        "# Evaluation: GPT-2 + LoRA legal clause tagger", "",
+        f"Test set: {m['n']} clauses written from **held-out templates** (phrasings never seen in training).", "",
+        "## Accuracy", "",
+        "| Model | Accuracy | Macro-F1 |", "|---|---|---|",
+        f"| GPT-2, tag tokens added, no fine-tuning (baseline) | {result['baseline']['accuracy']:.1%} | "
+        f"{result['baseline']['macro_f1']:.3f} |",
+        f"| GPT-2 + LoRA adapter (unmerged) | {m['accuracy']:.1%} | {m['macro_f1']:.3f} |",
+        f"| GPT-2 with LoRA merged into weights | {result['merged']['accuracy']:.1%} | "
+        f"{result['merged']['macro_f1']:.3f} |", "",
+        f"Merged and unmerged models agree on {result['merge_agreement']:.1%} of test clauses.", "",
+        "## Per-tag results", "", "| Tag | Precision | Recall | F1 | Support |", "|---|---|---|---|---|",
+    ]
+    for tag in tags:
+        c = m["per_class"][tag]
+        lines.append(f"| `{tag}` | {c['precision']:.2f} | {c['recall']:.2f} | {c['f1']:.2f} | {c['support']} |")
+    short = [t[:6] for t in tags]
+    lines += ["", "## Confusion matrix (rows = true tag, columns = predicted)", "",
+              "| true \\ pred | " + " | ".join(short) + " |", "|---" * (len(tags) + 1) + "|"]
+    for tag, row in zip(tags, m["confusion"]):
+        lines.append(f"| `{tag}` | " + " | ".join(str(v) if v else "." for v in row) + " |")
+    lines += ["", "## Efficiency", "",
+              "| | LoRA | Full fine-tuning |", "|---|---|---|",
+              f"| Trainable parameters | {eff['trainable_params']:,} ({eff['trainable_percent']:.3f}%) | "
+              f"{eff['base_params']:,} (100%) |",
+              f"| Saved weights on disk | {eff['adapter_mb']:.2f} MB | {eff['full_checkpoint_mb']:.0f} MB |",
+              "", f"LoRA trains **{eff['reduction_factor']:.0f}x fewer parameters**: "
+              f"{eff['lora_params']:,} in the rank-{result['config']['r']} adapters on "
+              f"{', '.join(result['config']['targets'])} plus {eff['tag_embedding_params']:,} in the new tag embeddings.",
+              "", "| Inference | ms per clause |", "|---|---|",
+              f"| Unmerged (extra LoRA matmuls) | {eff['latency_unmerged_ms']:.2f} |",
+              f"| Merged | {eff['latency_merged_ms']:.2f} |", "",
+              f"Device: {result['device']}.", ""]
+    lines += ["## Mistakes", ""]
+    if not m["mistakes"]:
+        lines.append("None on this test set.")
+    by_template: dict[str, int] = {}
+    for x in m["mistakes"]:
+        by_template[x["template"]] = by_template.get(x["template"], 0) + 1
+    if by_template:
+        lines += ["Errors by held-out template (tag/template number): "
+                  + ", ".join(f"`{t}` {n}" for t, n in sorted(by_template.items(), key=lambda kv: -kv[1])), ""]
+        low = sum(x["confidence"] < REVIEW_THRESHOLD for x in m["mistakes"])
+        lines += [f"{low} of {len(m['mistakes'])} mistakes fall below the {REVIEW_THRESHOLD:.0%} review threshold, "
+                  "so the `tag` command would flag them for a clerk.", ""]
+    for x in m["mistakes"][:15]:
+        lines.append(f"- true `{x['true']}`, predicted `{x['predicted']}` ({x['confidence']:.0%}): {x['text']}")
+    return "\n".join(lines) + "\n"
