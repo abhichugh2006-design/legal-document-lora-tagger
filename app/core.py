@@ -304,3 +304,91 @@ def load_tagger(adapter_path: str | Path, device: str | None = None):
     with torch.no_grad():
         model.get_input_embeddings().weight[tag_ids] = saved["tag_rows"]
     return model.to(pick_device(device)).eval(), tokenizer, tag_ids, config
+
+
+# =====================================================================================================
+# Milestone 5: Merge LoRA adapter and perform inference on new clauses
+# =====================================================================================================
+# Merging folds B @ A into each frozen weight (W <- W + alpha/r * B @ A), so the deployed model is a
+# plain GPT-2 with no extra layers and no extra latency. Inference reads the next-token distribution
+# after "Tag:" over the tag tokens only, which gives a confidence for each tag. A whole document is split
+# into clauses, each clause is tagged, and low-confidence clauses are flagged for a clerk to review.
+
+import re  # noqa: E402
+
+REVIEW_THRESHOLD = 0.6
+
+
+def merge_adapter(model) -> int:
+    """Milestone 5. Fold every LoRA update into its base weight. Returns the number of merged layers."""
+    return lora.merge_lora(model)
+
+
+def predict(model, tokenizer, tag_ids: list[int], texts: list[str], tags: list[str] = TAGS,
+            top_k: int = 3) -> list[dict]:
+    """Tag each clause: {'tag', 'confidence', 'alternatives': [(tag, prob), ...]}."""
+    probs = tag_probabilities(model, tokenizer, tag_ids, texts)
+    results = []
+    for row in probs:
+        values, idx = row.topk(min(top_k, len(tags)))
+        ranked = [(tags[i], round(v, 4)) for v, i in zip(values.tolist(), idx.tolist())]
+        results.append({"tag": ranked[0][0], "confidence": ranked[0][1], "alternatives": ranked[1:]})
+    return results
+
+
+_NUMBERED = re.compile(r"^\s*(?:\d+(?:\.\d+)*[.)]|\(?[a-z]\)|section\s+\d+|article\s+[\divx]+)", re.I)
+
+
+def split_into_clauses(document: str, min_words: int = 6) -> list[dict]:
+    """Split a document into blocks: paragraphs separated by blank lines, numbered items, and ALL-CAPS
+    title lines. Titles, headings and party lines (short, or no closing punctuation) are kept as
+    {'kind': 'heading'}; the rest are {'kind': 'clause'}."""
+    blocks, current = [], []
+    for raw in document.splitlines():
+        line = raw.strip()
+        starts_new = not line or _NUMBERED.match(line) or line.isupper() or (current and current[-1].isupper())
+        if starts_new and current:
+            blocks.append(" ".join(current))
+            current = []
+        if line:
+            current.append(line)
+    if current:
+        blocks.append(" ".join(current))
+
+    def kind(block: str) -> str:
+        return "clause" if len(block.split()) >= min_words and block.rstrip()[-1] in ".;:" else "heading"
+
+    return [{"kind": kind(b), "text": b} for b in blocks]
+
+
+def tag_document(model, tokenizer, tag_ids: list[int], document: str, tags: list[str] = TAGS,
+                 review_threshold: float = REVIEW_THRESHOLD) -> list[dict]:
+    blocks = split_into_clauses(document)
+    clauses = [b for b in blocks if b["kind"] == "clause"]
+    for block, result in zip(clauses, predict(model, tokenizer, tag_ids, [c["text"] for c in clauses], tags)):
+        block.update(result, needs_review=result["confidence"] < review_threshold)
+    return blocks
+
+
+def render_tagged_document(blocks: list[dict], title: str = "Tagged document") -> str:
+    """A Markdown report: every clause with its tag, confidence, and a review flag, plus a summary."""
+    clauses = [b for b in blocks if b["kind"] == "clause"]
+    flagged = [b for b in clauses if b["needs_review"]]
+    lines = [f"# {title}", "",
+             f"{len(clauses)} clauses tagged, {len(flagged)} flagged for manual review "
+             f"(confidence below {REVIEW_THRESHOLD:.0%}).", "", "| # | Tag | Confidence | Review |",
+             "|---|-----|-----------|--------|"]
+    for n, b in enumerate(clauses, 1):
+        lines.append(f"| {n} | `{b['tag']}` | {b['confidence']:.0%} | {'check' if b['needs_review'] else ''} |")
+    lines.append("")
+    n = 0
+    for b in blocks:
+        if b["kind"] == "heading":
+            lines += [f"## {b['text']}", ""]
+            continue
+        n += 1
+        alts = ", ".join(f"{t} {p:.0%}" for t, p in b["alternatives"])
+        flag = " **(needs review)**" if b["needs_review"] else ""
+        lines += [f"**[{n}] `{b['tag']}`** {b['confidence']:.0%}{flag} <sub>next: {alts}</sub>", "",
+                  f"> {b['text']}", ""]
+    return "\n".join(lines)

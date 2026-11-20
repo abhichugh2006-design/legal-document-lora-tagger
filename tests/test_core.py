@@ -140,9 +140,45 @@ def test_milestone_4_training_lowers_loss_and_only_touches_the_adapter(tiny_gpt2
 
 
 # Milestone 5: Merge LoRA adapter and perform inference on new clauses
-@pytest.mark.skip(reason="remove this line when you start milestone 5")
-def test_milestone_5():
-    raise NotImplementedError("write the test for milestone 5")
+def test_milestone_5_merged_model_gives_the_same_tags_without_lora_layers(tiny_gpt2, gpt2_tokenizer):
+    import torch
+
+    from app.lora import LoRALayer
+
+    model, tok, tag_ids = _tagger(tiny_gpt2, gpt2_tokenizer, r=4, alpha=8, dropout=0.0)
+    with torch.no_grad():  # pretend training happened: give every B a non-zero value
+        for m in model.modules():
+            if isinstance(m, LoRALayer):
+                m.lora_B.normal_(std=0.5)
+    texts = ["The City may terminate this Agreement on thirty days notice.", "Payment is due in 30 days."]
+    before = core.tag_probabilities(model, tok, tag_ids, texts)
+    base_ids = torch.tensor([tok.encode(texts[0])])
+    logits_before = model(base_ids).logits
+
+    assert core.merge_adapter(model) == model.config.n_layer
+    assert not any(isinstance(m, LoRALayer) for m in model.modules())
+    assert torch.allclose(model(base_ids).logits, logits_before, atol=1e-4)
+    assert torch.allclose(core.tag_probabilities(model, tok, tag_ids, texts), before, atol=1e-5)
+
+    results = core.predict(model, tok, tag_ids, texts)
+    assert len(results) == 2
+    for r in results:
+        assert r["tag"] in TAGS and 0 < r["confidence"] <= 1 and len(r["alternatives"]) == 2
+
+
+def test_milestone_5_documents_split_into_clauses_and_render(tiny_gpt2, gpt2_tokenizer):
+    from pathlib import Path
+
+    document = Path("examples/sample_public_contract.txt").read_text()
+    blocks = core.split_into_clauses(document)
+    assert sum(b["kind"] == "clause" for b in blocks) == 10
+    assert blocks[0] == {"kind": "heading", "text": "PROFESSIONAL SERVICES AGREEMENT"}
+
+    model, tok, tag_ids = _tagger(tiny_gpt2, gpt2_tokenizer)
+    tagged = core.tag_document(model, tok, tag_ids, document)
+    report = core.render_tagged_document(tagged, "Sample")
+    assert report.startswith("# Sample") and "| 10 |" in report
+    assert all("tag" in b and "needs_review" in b for b in tagged if b["kind"] == "clause")
 
 
 # Milestone 6: Evaluate tagging accuracy and model efficiency

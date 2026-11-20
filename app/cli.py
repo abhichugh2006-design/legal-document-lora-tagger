@@ -41,6 +41,32 @@ def cmd_train(args) -> None:
                                "final_loss": history["loss"][-1]})
 
 
+def cmd_tag(args) -> None:
+    import json
+    from pathlib import Path
+
+    from app import core
+
+    model, tokenizer, tag_ids, config = core.load_tagger(args.adapter, args.device)
+    merged = core.merge_adapter(model)
+    print(f"Merged LoRA into {merged} layers; tagging {args.document}")
+    blocks = core.tag_document(model, tokenizer, tag_ids, Path(args.document).read_text(), config["tags"],
+                               review_threshold=args.review_threshold)
+    report = core.render_tagged_document(blocks, f"Tagged: {Path(args.document).name}")
+    out = Path(args.out or f"outputs/{Path(args.document).stem}.tagged.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report)
+    out.with_suffix(".json").write_text(json.dumps(blocks, indent=2))
+    for n, b in enumerate([b for b in blocks if b["kind"] == "clause"], 1):
+        flag = "  <- review" if b["needs_review"] else ""
+        print(f"{n:3d}. {b['tag']:24s} {b['confidence']:5.0%}  {b['text'][:60]}...{flag}")
+    print(f"\nWrote {out} and {out.with_suffix('.json')}")
+    if args.save_merged:
+        model.save_pretrained(args.save_merged)
+        tokenizer.save_pretrained(args.save_merged)
+        print(f"Saved merged GPT-2 to {args.save_merged}")
+
+
 def add_lora_args(p) -> None:
     p.add_argument("--rank", type=int, default=8)
     p.add_argument("--alpha", type=float, default=16.0)
@@ -72,6 +98,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", default="artifacts/adapter.pt")
     p.set_defaults(func=cmd_train)
 
+    p = sub.add_parser("tag", help="milestone 5: merge the adapter and tag every clause in a document")
+    p.add_argument("document", help="plain-text file, clauses separated by blank lines or numbering")
+    p.add_argument("--adapter", default="artifacts/adapter.pt")
+    p.add_argument("--out", help="Markdown report path (default: outputs/<name>.tagged.md)")
+    p.add_argument("--review-threshold", type=float, default=0.6)
+    p.add_argument("--save-merged", help="also save the merged model to this folder")
+    p.add_argument("--device")
+    p.set_defaults(func=cmd_tag)
 
     args = parser.parse_args(argv)
     if args.command == "hello":
